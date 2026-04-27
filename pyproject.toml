@@ -1,0 +1,40 @@
+[project]
+name = "thesis"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+training = [
+  "psycopg2-binary>=2.9.11",
+  "sqlalchemy>=2.0.48",
+  "pandas>=3.0.1",
+  "pyarrow>=23.0.1",
+  "pyyaml>=6.0.3",
+  "python-dotenv>=1.2.2",
+  "tqdm>=4.67.3",
+  "spacy==3.8.11",
+  "de-core-news-lg @ https://github.com/explosion/spacy-models/releases/download/de_core_news_lg-3.8.0/de_core_news_lg-3.8.0-py3-none-any.whl",
+]
+analysis = [
+  "beautifulsoup4>=4.14.3",
+  "gensim>=4.4.0",
+  "ipykernel>=7.2.0",
+  "jupyter-client>=8.8.0",
+  "jupyter-core>=5.9.1",
+  "matplotlib>=3.10.8",
+  "mizani>=0.14.4",
+  "nbconvert>=7.17.0",
+  "nbformat>=5.10.4",
+  "nltk>=3.9.3",
+  "numpy>=2.4.3",
+  "plotnine>=0.15.3",
+  "scikit-learn>=1.8.0",
+  "scikit-misc>=0.5.2",
+  "scipy>=1.17.1",
+  "seaborn>=0.13.2",
+  "statsmodels>=0.14.6",
+]
+dev = [
+  "nbstripout>=0.9.1",
+]

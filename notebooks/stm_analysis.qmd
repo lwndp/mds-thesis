@@ -1,0 +1,1751 @@
+---
+title: "STM Analysis"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    embed-resources: true
+    code-fold: true
+
+execute:
+  warning: false
+  message: false
+  cache: true
+---
+
+```{r setup, cache=FALSE}
+suppressPackageStartupMessages({
+    library(arrow)
+    library(dplyr)
+    library(tidyr)
+    library(ggplot2)
+    library(svglite)
+    library(yaml)
+    library(splines)
+    library(scales)
+    library(patchwork)
+    library(ggrepel)
+})
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+REPO_ROOT <- system("git rev-parse --show-toplevel", intern = TRUE)
+STM_DIR <- file.path(REPO_ROOT, "data", "stm")
+FIGURES <- file.path(REPO_ROOT, "data", "figures_out")
+dir.create(FIGURES, showWarnings = FALSE, recursive = TRUE)
+
+# ── Shared config (config.yaml also consumed by notebook_utils.py) ──────────
+cfg <- yaml::read_yaml(file.path(REPO_ROOT, "notebooks", "config.yaml"))
+TW <- as.numeric(cfg$figures$text_width)
+DPI <- as.numeric(cfg$figures$dpi)
+RED <- cfg$colors$red
+GRAY <- cfg$colors$gray
+DARK_GRAY <- cfg$colors$dark_gray
+GRID_GRAY <- cfg$colors$grid_gray
+NS_GRAY <- cfg$colors$not_significant
+
+BLUE <- cfg$colors$blue
+SIG_ALPHA <- as.numeric(cfg$stm$model$sig_alpha)
+SPLINE_DF <- as.integer(cfg$stm$model$spline_df)
+X_BREAK_YEARS <- unlist(cfg$stm$plot$x_break_years)
+LABEL_WRAP_WIDTH <- as.integer(cfg$stm$plot$label_wrap_width)
+NARRATIVE_LABEL_WRAP_WIDTH <- as.integer(cfg$stm$plot$narrative_label_wrap_width)
+ENTROPY_EPS <- as.numeric(cfg$stm$plot$entropy_eps)
+ENTROPY_BINWIDTH <- as.numeric(cfg$stm$plot$entropy_binwidth)
+ENTROPY_LABEL_X_OFFSET <- as.numeric(cfg$stm$plot$entropy_label_x_offset)
+ENTROPY_LABEL_Y <- as.numeric(cfg$stm$plot$entropy_label_y)
+
+TOP_N_PREVALENCE <- cfg$stm$top_n$prevalence
+TOP_N_GENDER_FOREST <- cfg$stm$top_n$gender_forest
+TOP_N_FACTION_VARIANCE <- cfg$stm$top_n$faction_variance
+TOP_N_COMPOSITION_FOREST <- cfg$stm$top_n$composition_forest
+
+NARRATIVE_TOPICS <- as.integer(unlist(cfg$stm$narrative_topics))
+FACTION_PLOT_ORDER <- unlist(cfg$analysis$factions$plot_order)
+
+thesis_theme <- theme_bw() + theme(
+    text                  = element_text(family = "serif", size = 9),
+    plot.title            = element_text(size = 10, face = "bold"),
+    axis.title            = element_text(size = 9),
+    axis.text             = element_text(size = 8),
+    panel.grid.major.x    = element_blank(),
+    panel.grid.minor      = element_blank(),
+    panel.border          = element_blank(),
+    axis.line             = element_line(colour = cfg$colors$axis_line, linewidth = 0.4),
+    plot.margin           = margin(6, 8, 6, 6, "pt"),
+    legend.position       = "top",
+    strip.text            = element_text(margin = margin(3, 4, 3, 4, "pt"))
+)
+
+GENDER_COLORS <- unlist(cfg$colors$genders)
+
+# Lighten bar fills while keeping the original outline color.
+lighten_color <- function(col, amount = 0.6) {
+    rgb_mat <- grDevices::col2rgb(col)
+    rgb_light <- rgb_mat + (255 - rgb_mat) * amount
+    grDevices::rgb(
+        rgb_light[1, ] / 255,
+        rgb_light[2, ] / 255,
+        rgb_light[3, ] / 255
+    )
+}
+
+# ── Output directories ────────────────────────────────────────────────────────
+TABLES_DIR <- file.path(REPO_ROOT, "writing", "include", "tables")
+dir.create(TABLES_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# ── Typst table writer ────────────────────────────────────────────────────────
+# Writes a dataframe as a native Typst #table(...) snippet to `path`.
+# col_align: character vector of "left"/"right" per column (default: left + right for rest).
+# groups: optional named list where names are group labels and values are integer
+# vectors of row indices belonging to that group. Inserts a colspan row header.
+write_typst_table <- function(df, path, col_align = NULL, groups = NULL) {
+    n <- ncol(df)
+    nms <- names(df)
+    if (is.null(col_align)) col_align <- c("left", rep("right", n - 1))
+    align_str <- paste(col_align, collapse = ", ")
+    esc <- function(x) {
+        x <- as.character(x)
+        x <- gsub("%", "\\%", x, fixed = TRUE)
+        x <- gsub("<", "\\<", x, fixed = TRUE)
+        x <- gsub("[", "\\[", x, fixed = TRUE)
+        x <- gsub("]", "\\]", x, fixed = TRUE)
+        x
+    }
+
+    header <- sprintf(
+        "  table.header(%s),",
+        paste(sprintf("[*%s*]", nms), collapse = ", ")
+    )
+
+    # Build a lookup: row index --> group label (NULL if no groups)
+    row_group <- rep(NA_character_, nrow(df))
+    if (!is.null(groups)) {
+        for (g in names(groups)) row_group[groups[[g]]] <- g
+    }
+
+    rows <- character(0)
+    last_group <- NA_character_
+    for (i in seq_len(nrow(df))) {
+        grp <- row_group[i]
+        if (!is.na(grp) && (is.na(last_group) || grp != last_group)) {
+            rows <- c(rows, sprintf(
+                "  table.cell(colspan: %d, align: left)[_%s_],", n, grp
+            ))
+            last_group <- grp
+        }
+        cells <- vapply(seq_len(n), function(j) {
+            v <- df[[j]][i]
+            if (is.na(v) || v == "NA") "[—]" else sprintf("[%s]", esc(v))
+        }, character(1))
+        rows <- c(rows, paste0("  ", paste(cells, collapse = ", "), ","))
+    }
+
+    lines <- c(
+        "#table(",
+        sprintf("  columns: %d,", n),
+        "  stroke: none,",
+        "  inset: (x: 5pt, y: 3pt),",
+        sprintf("  align: (%s),", align_str),
+        "  table.hline(stroke: 1.5pt),",
+        header,
+        "  table.hline(y: 1, stroke: .75pt),",
+        rows,
+        "  table.hline(stroke: 1.5pt),",
+        ")"
+    )
+    writeLines(lines, path)
+}
+```
+
+```{r preflight, cache=FALSE}
+required_stm_files <- c(
+    "topic_labels.parquet", "coef_table.parquet", "theta.parquet",
+    "mean_theta_by_gender.parquet", "mean_theta_by_faction.parquet",
+    "stm_effects.rds", "female_share_ft.parquet", "topic_labels_annotated.csv"
+)
+missing <- required_stm_files[!file.exists(file.path(STM_DIR, required_stm_files))]
+if (length(missing) > 0) {
+    stop(paste0(
+        "Missing STM output files in data/stm/:\n  ",
+        paste(missing, collapse = "\n  "),
+        "Load the data or run the STM pipeline first."
+    ))
+}
+```
+
+```{r load}
+topic_labels <- read_parquet(file.path(STM_DIR, "topic_labels.parquet"))
+coef_table <- read_parquet(file.path(STM_DIR, "coef_table.parquet"))
+theta <- read_parquet(file.path(STM_DIR, "theta.parquet"))
+mean_gender <- read_parquet(file.path(STM_DIR, "mean_theta_by_gender.parquet"))
+mean_faction <- read_parquet(file.path(STM_DIR, "mean_theta_by_faction.parquet"))
+effects <- readRDS(file.path(STM_DIR, "stm_effects.rds"))
+
+topic_cols <- grep("^topic_", names(theta), value = TRUE)
+K_total <- length(topic_cols)
+cat(sprintf(
+    "K=%d topics | %s speeches | %d–%d\n",
+    K_total, format(nrow(theta), big.mark = ","),
+    min(theta$year), max(theta$year)
+))
+```
+
+## Topic labels
+
+```{r labels}
+manual <- read.csv(file.path(STM_DIR, "topic_labels_annotated.csv"),
+    stringsAsFactors = FALSE
+)
+manual$label_en[manual$label_en == ""] <- NA
+manual$label_en <- ifelse(
+    is.na(manual$label_en),
+    trimws(sub(",.*", "", manual$frex)),
+    manual$label_en
+)
+manual$label <- sprintf("%02d: %s", manual$topic, manual$label_en)
+
+TOPIC_LABEL <- setNames(manual$label, manual$topic)
+
+# ── Global filter: procedural/rhetorical topics ───────────────────────────────
+PROCEDURAL <- manual$topic[as.logical(manual$is_procedural)]
+drop_cols <- sprintf("topic_%02d", PROCEDURAL)
+
+theta <- theta |> select(-any_of(drop_cols))
+mean_gender <- mean_gender |> select(-any_of(drop_cols))
+mean_faction <- mean_faction |> select(-any_of(drop_cols))
+coef_table <- coef_table |> filter(!topic %in% PROCEDURAL)
+topic_labels <- topic_labels |> filter(!topic %in% PROCEDURAL)
+topic_cols <- grep("^topic_", names(theta), value = TRUE)
+K <- length(topic_cols)
+
+cat(sprintf(
+    "After removing %d procedural topics: K=%d substantive\n",
+    length(PROCEDURAL), K
+))
+```
+
+## Model evaluation
+
+### Corpus summary
+
+```{r corpus-summary, cache=FALSE}
+n_total <- nrow(theta)
+n_female <- sum(theta$gender == "female")
+n_male <- sum(theta$gender == "male")
+
+tribble(
+    ~Statistic,               ~Value,
+    "Speeches (total)",       format(n_total, big.mark = ","),
+    "— female speakers",      sprintf("%s  (%.1f%%)", format(n_female, big.mark = ","), 100 * n_female / n_total),
+    "— male speakers",        sprintf("%s  (%.1f%%)", format(n_male, big.mark = ","), 100 * n_male / n_total),
+    "Period",                 sprintf("%d–%d", min(theta$year), max(theta$year)),
+    "Number of topics K",     as.character(K_total),
+    "Initialisation",         "Spectral (Arora et al. 2013)",
+    "Random seed",            "42",
+    "Prevalence formula",     "gender × s(year, df=5) + faction",
+) |> knitr::kable(col.names = c("", ""))
+```
+
+```{r tbl-sample-composition, dependson='labels', cache=FALSE}
+# theta has `electoral_term` here; `wp` alias is added later in merge-seat-share
+tbl_sample <- theta |>
+    filter(electoral_term %in% 12:19) |>
+    group_by(electoral_term) |>
+    summarise(
+        Total = format(n(), big.mark = ","),
+        Female = sprintf(
+            "%s (%.1f%%)", format(sum(gender == "female"), big.mark = ","),
+            100 * mean(gender == "female")
+        ),
+        Male = sprintf(
+            "%s (%.1f%%)", format(sum(gender == "male"), big.mark = ","),
+            100 * mean(gender == "male")
+        ),
+        .groups = "drop"
+    ) |>
+    mutate(`Electoral term` = paste0("WP", electoral_term)) |>
+    select(`Electoral term`, Total, Female, Male)
+
+write_typst_table(tbl_sample, file.path(TABLES_DIR, "tbl_sample_composition.typ"))
+```
+
+```{r tbl-stm-spec, dependson='labels', cache=FALSE}
+tbl_spec <- tibble(
+    Parameter = c(
+        "Topics ($K$)",
+        "Prevalence formula", "Initialisation", "Seed",
+        "Min. term frequency", "Min. document frequency", "Max. document frequency"
+    ),
+    Value = c(
+        sprintf("%d (spectral auto)", K_total),
+        "gender \u00d7 s(year, df=5) + faction",
+        "Spectral (Arora et al., 2013)", "42",
+        "10", "5 documents", "99%"
+    )
+)
+
+write_typst_table(tbl_spec, file.path(TABLES_DIR, "tbl_stm_spec.typ"),
+    col_align = c("left", "left")
+)
+```
+
+### Word exclusivity vs. document concentration
+
+```{r exclusivity, dependson='labels'}
+top10 <- lapply(
+    setNames(topic_labels$prob, topic_labels$topic),
+    function(s) trimws(strsplit(s, ",")[[1]][1:10])
+)
+word_freq <- table(unlist(top10))
+
+exclusivity <- sapply(top10, function(ws) mean(word_freq[ws] == 1))
+
+top5pct <- ceiling(SIG_ALPHA * nrow(theta))
+concentration <- sapply(topic_cols, function(col) {
+    x <- theta[[col]]
+    mean(sort(x, decreasing = TRUE)[1:top5pct])
+})
+
+df_excl <- data.frame(
+    topic = as.integer(names(exclusivity)),
+    exclusivity = exclusivity,
+    concentration = concentration
+)
+mean_excl <- mean(df_excl$exclusivity)
+mean_conc <- mean(df_excl$concentration)
+cor_excl_conc <- cor(df_excl$exclusivity, df_excl$concentration)
+med_excl <- median(df_excl$exclusivity)
+med_conc <- median(df_excl$concentration)
+n_hi_quality <- sum(df_excl$exclusivity >= med_excl & df_excl$concentration >= med_conc)
+share_hi_quality <- n_hi_quality / nrow(df_excl)
+
+sig_topics <- coef_table |>
+    filter(term == "genderfemale", pval < SIG_ALPHA) |>
+    pull(topic)
+df_excl$sig <- df_excl$topic %in% sig_topics
+
+p <- ggplot(df_excl, aes(exclusivity, concentration, colour = sig, shape = sig, fill = sig)) +
+    geom_point(size = 1.8, stroke = 0.6) +
+    scale_colour_manual(
+        values = c("TRUE" = RED, "FALSE" = NS_GRAY),
+        labels = function(x) {
+            txt <- ifelse(
+                x == "TRUE",
+                sprintf("'Sig. gender effect ('*italic(p)<%s*')'", format(SIG_ALPHA, nsmall = 2)),
+                "'Not significant'"
+            )
+            parse(text = txt)
+        },
+        name = NULL
+    ) +
+    scale_fill_manual(values = c("TRUE" = RED, "FALSE" = "white"), guide = "none") +
+    scale_shape_manual(values = c("TRUE" = 16, "FALSE" = 21), guide = "none") +
+    scale_x_continuous(labels = percent) +
+    labs(
+        x = "Word exclusivity",
+        y = "Topic concentration (mean \u03b8)"
+    ) +
+    thesis_theme
+
+ggsave(file.path(FIGURES, "stm_exclusivity_concentration.svg"),
+    p,
+    width = TW, height = TW * 0.75, dpi = DPI
+)
+p
+```
+
+### Document topic entropy
+
+```{r entropy, dependson='labels'}
+theta_mat <- as.matrix(theta[, topic_cols])
+doc_entropy <- -rowSums(theta_mat * log(theta_mat + ENTROPY_EPS))
+norm_entropy <- doc_entropy / log(K_total)
+mean_norm <- mean(norm_entropy)
+
+df_ent <- data.frame(norm_entropy = norm_entropy)
+p <- ggplot(df_ent, aes(norm_entropy)) +
+    geom_histogram(binwidth = ENTROPY_BINWIDTH, fill = "#c2c2c2", colour = "white", linewidth = 0.2) +
+    geom_vline(xintercept = mean_norm, colour = RED, linetype = "dashed", linewidth = 0.7) +
+    annotate("text",
+        x = mean_norm + ENTROPY_LABEL_X_OFFSET, y = ENTROPY_LABEL_Y,
+        label = sprintf("Mean = %.2f", mean_norm),
+        colour = RED, size = 2.8, hjust = 0
+    ) +
+    scale_x_continuous(labels = percent, limits = c(0, 1)) +
+    labs(
+        x = "Normalised topic entropy",
+        y = "Speeches"
+    ) +
+    thesis_theme
+
+ggsave(file.path(FIGURES, "stm_doc_entropy.svg"),
+    p,
+    width = TW, height = TW * 0.6, dpi = DPI
+)
+p
+```
+
+```{r sig-summary, dependson='labels'}
+df_gf <- coef_table |> filter(term == "genderfemale")
+
+lapply(c(0.001, 0.01, 0.05), function(a) {
+    sig <- df_gf |> filter(pval < a)
+    tibble(
+        Threshold = sprintf("$p < %s$", a),
+        `Female > Male` = sum(sig$estimate > 0),
+        `Male > Female` = sum(sig$estimate < 0),
+        `Total sig.` = nrow(sig),
+        `% of K` = sprintf("%.1f%%", 100 * nrow(sig) / K)
+    )
+}) |>
+    bind_rows() |>
+    knitr::kable()
+```
+
+```{r tbl-stm-diagnostics, dependson=c('exclusivity','entropy'), cache=FALSE}
+tbl_diag <- tibble(
+    Metric = c(
+        "Mean normalised document entropy",
+        "Mean word exclusivity",
+        "Mean topic concentration (top 5% docs)",
+        "Correlation: exclusivity vs concentration",
+        "Topics above both medians"
+    ),
+    Value = c(
+        sprintf("%.2f", mean_norm),
+        sprintf("%.1f%%", 100 * mean_excl),
+        sprintf("%.3f", mean_conc),
+        sprintf("%.2f", cor_excl_conc),
+        sprintf("%d/%d (%s)", n_hi_quality, nrow(df_excl), sprintf("%.1f%%", 100 * share_hi_quality))
+    )
+)
+
+write_typst_table(
+    tbl_diag,
+    file.path(TABLES_DIR, "tbl_stm_diagnostics.typ"),
+    col_align = c("left", "left")
+)
+```
+
+## Female seat share data
+
+Pre-computed female seat shares by faction and electoral term are loaded here and merged into the speech-level data. This makes `theta$wp` and `theta$female_share_ft` available throughout all subsequent analyses.
+
+```{r seat-share, cache.extra=file.mtime(file.path(STM_DIR,"female_share_ft.parquet"))}
+# Pre-computed by compute_seat_share.py from MDB_STAMMDATEN.XML
+female_share_ft <- read_parquet(file.path(STM_DIR, "female_share_ft.parquet")) |>
+    rename(wp = electoral_term)
+
+knitr::kable(female_share_ft |> pivot_wider(
+    names_from = faction, values_from = female_share_ft
+), digits = 3, caption = "Female seat share by faction and electoral term")
+```
+
+```{r tbl-seat-share, dependson='seat-share', cache=FALSE}
+tbl_wide <- female_share_ft |>
+    mutate(
+        wp              = paste0("WP", wp),
+        female_share_ft = sprintf("%.1f%%", female_share_ft * 100)
+    ) |>
+    pivot_wider(names_from = faction, values_from = female_share_ft, values_fill = "\u2014") |>
+    rename(`Electoral term` = wp) |>
+    select(`Electoral term`, any_of(FACTION_PLOT_ORDER))
+
+write_typst_table(tbl_wide, file.path(TABLES_DIR, "tbl_female_seat_share.typ"),
+    col_align = c("left", rep("right", ncol(tbl_wide) - 1))
+)
+```
+
+```{r merge-seat-share, dependson=c('seat-share','labels')}
+theta <- theta |>
+    rename(wp = electoral_term) |>
+    filter(wp >= cfg$analysis$bounds$term_lower, wp <= cfg$analysis$bounds$term_upper) |>
+    left_join(female_share_ft, by = c("wp", "faction"))
+
+cat(sprintf(
+    "Merged: %s speeches, %d with missing seat share\n",
+    format(nrow(theta), big.mark = ","),
+    sum(is.na(theta$female_share_ft))
+))
+```
+
+---
+
+## Part I: Individual differences
+
+### Topic prevalence
+
+```{r prevalence, dependson='labels'}
+prevalence <- theta |>
+    summarise(across(all_of(topic_cols), mean)) |>
+    pivot_longer(everything(), names_to = "topic_col", values_to = "theta") |>
+    mutate(
+        topic = as.integer(sub("topic_0*", "", topic_col)),
+        label = TOPIC_LABEL[as.character(topic)]
+    ) |>
+    slice_max(theta, n = TOP_N_PREVALENCE) |>
+    arrange(theta) |>
+    mutate(label = factor(label, levels = label))
+
+p <- ggplot(prevalence, aes(label, theta)) +
+    geom_col(
+        fill = lighten_color(DARK_GRAY, 0.6),
+        colour = NA,
+        width = 0.75
+    ) +
+    coord_flip(clip = "off") +
+    scale_y_continuous(labels = \(x) sprintf("%.3f", x)) +
+    labs(
+        x = NULL, y = "Mean θ"
+    ) +
+    thesis_theme +
+    theme(axis.text.y = element_text(size = 8.5))
+
+ggsave(file.path(FIGURES, "stm_topic_prevalence.svg"),
+    p,
+    width = TW, height = TW * 0.95, dpi = DPI
+)
+p
+```
+
+```{r prevalence-all}
+# All 100 topics for the appendix reference figure (including procedural/rhetorical)
+all_labels <- read.csv(file.path(STM_DIR, "topic_labels_annotated.csv"),
+    stringsAsFactors = FALSE
+)
+all_labels$label_en[all_labels$label_en == ""] <- NA
+all_labels$label_en <- ifelse(
+    is.na(all_labels$label_en),
+    trimws(sub(",.*", "", all_labels$frex)),
+    all_labels$label_en
+)
+
+theta_all <- read_parquet(file.path(STM_DIR, "theta.parquet"))
+all_topic_cols <- grep("^topic_", names(theta_all), value = TRUE)
+
+prevalence_all <- theta_all |>
+    summarise(across(all_of(all_topic_cols), mean)) |>
+    pivot_longer(everything(), names_to = "topic_col", values_to = "theta") |>
+    mutate(topic = as.integer(sub("topic_0*", "", topic_col))) |>
+    left_join(all_labels[, c("topic", "label_en")], by = "topic") |>
+    mutate(
+        label = sprintf("%03d  %s", topic, label_en),
+        procedural = topic %in% PROCEDURAL
+    ) |>
+    arrange(theta) |>
+    mutate(
+        rank = row_number(),
+        col_group = ifelse(rank > ceiling(n() / 2), "left", "right"),
+        label = factor(label, levels = label)
+    )
+
+p_all <- ggplot(prevalence_all, aes(theta, label, fill = procedural)) +
+    geom_col(width = 0.75, colour = NA) +
+    facet_wrap(~col_group, ncol = 2, scales = "free_y") +
+    scale_fill_manual(
+        values = c(
+            "FALSE" = RED,
+            "TRUE" = BLUE
+        ),
+        labels = c("FALSE" = "Substantive", "TRUE" = "Procedural / rhetorical"),
+        name = NULL
+    ) +
+    scale_x_continuous(
+        labels = \(x) sprintf("%.3f", x),
+        expand = expansion(mult = c(0, 0.04))
+    ) +
+    labs(x = "Mean \u03b8", y = NULL) +
+    thesis_theme +
+    theme(
+        axis.text.y        = element_text(size = 8.5),
+        legend.text        = element_text(size = 8),
+        panel.grid.major.y = element_blank(),
+        panel.grid.major.x = element_line(colour = GRID_GRAY, linewidth = 0.3),
+        strip.text         = element_blank(),
+        strip.background   = element_blank()
+    )
+
+ggsave(
+    file.path(FIGURES, "stm_topic_prevalence_all.svg"),
+    p_all,
+    width = TW * 2, height = TW * 1.9, dpi = DPI
+)
+p_all
+```
+
+### Topic prevalence over time
+
+Each line is one topic's mean speech share per year. The two panels separate substantive from procedural topics; the log-scale y-axis makes within-group variance visible even for low-prevalence topics.
+
+```{r prevalence-over-time, dependson='prevalence-all'}
+# Mean theta per topic per year - all topics, faceted by type
+all_topic_cols_ot <- grep("^topic_", names(theta_all), value = TRUE)
+
+theta_long_year <- theta_all |>
+    select(year, all_of(all_topic_cols_ot)) |>
+    group_by(year) |>
+    summarise(across(everything(), mean), .groups = "drop") |>
+    pivot_longer(-year, names_to = "topic_col", values_to = "theta_mean") |>
+    mutate(topic = as.integer(sub("topic_0*", "", topic_col))) |>
+    left_join(
+        all_labels[, c("topic", "label_en", "is_procedural")],
+        by = "topic"
+    ) |>
+    mutate(
+        topic_type = ifelse(as.logical(is_procedural), "Procedural / rhetorical", "Substantive"),
+        topic_type = factor(topic_type, levels = c("Substantive", "Procedural / rhetorical"))
+    )
+
+# Median across topics per year × type
+median_year <- theta_long_year |>
+    group_by(year, topic_type) |>
+    summarise(theta_median = median(theta_mean), .groups = "drop")
+
+p_ot <- ggplot(theta_long_year, aes(year, theta_mean)) +
+    geom_line(
+        aes(group = topic_col, colour = "Individual topic"),
+        linewidth = 0.25, alpha = 0.6
+    ) +
+    geom_line(
+        data = median_year,
+        aes(y = theta_median, colour = "Median"),
+        linewidth = 0.7
+    ) +
+    facet_wrap(~topic_type, ncol = 1) +
+    scale_colour_manual(
+        values = c("Individual topic" = GRAY, "Median" = RED),
+        name = NULL
+    ) +
+    scale_x_continuous(breaks = X_BREAK_YEARS) +
+    scale_y_log10(labels = scales::label_number(accuracy = 0.001)) +
+    labs(
+        x = NULL,
+        y = "Mean \u03b8 (log scale)"
+    ) +
+    thesis_theme +
+    theme(
+        legend.position = "top",
+        strip.text = element_text(size = 8, hjust = 0)
+    )
+
+ggsave(
+    file.path(FIGURES, "stm_topic_prevalence_over_time.svg"),
+    p_ot,
+    width = TW, height = TW * 1.4, dpi = DPI
+)
+p_ot
+
+# Simplified version: geometric mean +/- 1 SD on log scale per year × type. Band is computed in log space to avoid negative ymin values being dropped
+mean_band_year <- theta_long_year |>
+    group_by(year, topic_type) |>
+    summarise(
+        log_mean = mean(log10(theta_mean)),
+        log_sd = sd(log10(theta_mean)),
+        .groups = "drop"
+    ) |>
+    mutate(
+        theta_mean_agg = 10^log_mean,
+        ymin = 10^(log_mean - log_sd),
+        ymax = 10^(log_mean + log_sd)
+    )
+
+type_colours <- c("Substantive" = RED, "Procedural / rhetorical" = BLUE)
+type_fills <- c("Substantive" = RED, "Procedural / rhetorical" = BLUE)
+
+p_ot_simple <- ggplot(
+    mean_band_year,
+    aes(year, theta_mean_agg, colour = topic_type, fill = topic_type)
+) +
+    geom_ribbon(aes(ymin = ymin, ymax = ymax), alpha = 0.15, colour = NA) +
+    geom_line(linewidth = 0.7) +
+    scale_colour_manual(values = type_colours, name = NULL) +
+    scale_fill_manual(values = type_fills, name = NULL) +
+    scale_x_continuous(breaks = X_BREAK_YEARS) +
+    scale_y_log10(labels = scales::label_number(accuracy = 0.001)) +
+    labs(x = NULL, y = "Mean θ (log scale)") +
+    thesis_theme +
+    theme(legend.position = "top")
+
+ggsave(
+    file.path(FIGURES, "stm_topic_prevalence_over_time_mean.svg"),
+    p_ot_simple,
+    width = TW, height = TW * 0.75, dpi = DPI
+)
+p_ot_simple
+```
+
+### Gender gap in topic allocation
+
+```{r forest-plot, dependson='labels'}
+df_coef <- coef_table |>
+    filter(term == "genderfemale") |>
+    mutate(
+        label = sub("^\\d+: ", "", TOPIC_LABEL[as.character(topic)]),
+        ci_lo = estimate - 1.96 * se,
+        ci_hi = estimate + 1.96 * se,
+        sig = pval < SIG_ALPHA
+    ) |>
+    slice_max(abs(tval), n = TOP_N_GENDER_FOREST) |>
+    arrange(estimate) |>
+    mutate(
+        label = sapply(label, function(x) paste(strwrap(x, width = LABEL_WRAP_WIDTH), collapse = "\n")),
+        label = factor(label, levels = label)
+    )
+
+p <- ggplot(df_coef, aes(estimate, label, colour = sig, shape = sig, fill = sig)) +
+    geom_vline(xintercept = 0, colour = cfg$colors$axis_line, linewidth = 0.4, linetype = "dashed") +
+    geom_errorbarh(aes(xmin = ci_lo, xmax = ci_hi), height = 0, linewidth = 0.4) +
+    geom_point(size = 2.5, stroke = 0.6) +
+    scale_colour_manual(values = c("TRUE" = RED, "FALSE" = NS_GRAY)) +
+    scale_fill_manual(values = c("TRUE" = RED, "FALSE" = "white"), guide = "none") +
+    scale_shape_manual(values = c("TRUE" = 16, "FALSE" = 21)) +
+    scale_x_continuous(labels = \(x) sprintf("%+.0f\u2030", x * 1000)) +
+    labs(
+        x = "\u0394\u03b8 (female \u2212 male, \u00b195% CI)",
+        y = NULL
+    ) +
+    thesis_theme +
+    theme(legend.position = "none", axis.text.y = element_text(size = 7))
+
+ggsave(file.path(FIGURES, "stm_gender_coef.svg"),
+    p,
+    width = TW, height = TW * 1.3, dpi = DPI
+)
+p
+```
+
+```{r tbl-gender-coef, dependson='forest-plot', cache=FALSE}
+df_gf <- coef_table |>
+    filter(term == "genderfemale") |>
+    mutate(
+        label = sub("^\\d+: ", "", TOPIC_LABEL[as.character(topic)]),
+        sig   = pval < SIG_ALPHA
+    )
+
+top_female <- df_gf |>
+    filter(sig, estimate > 0) |>
+    arrange(desc(estimate))
+top_male <- df_gf |>
+    filter(sig, estimate < 0) |>
+    arrange(estimate)
+
+tbl_coef <- bind_rows(
+    mutate(top_female, direction = "Female-coded topics"),
+    mutate(top_male, direction = "Male-coded topics")
+) |>
+    transmute(
+        direction,
+        Topic = label,
+        `Coef. (‰)` = sprintf("%+.2f", estimate * 1000),
+        `95% CI` = sprintf(
+            "[%+.2f, %+.2f]",
+            (estimate - 1.96 * se) * 1000,
+            (estimate + 1.96 * se) * 1000
+        ),
+        `p` = ifelse(pval < 0.001, "<0.001", sprintf("%.3f", pval))
+    )
+
+groups_coef <- list(
+    "Female-coded topics" = which(tbl_coef$direction == "Female-coded topics"),
+    "Male-coded topics"   = which(tbl_coef$direction == "Male-coded topics")
+)
+
+write_typst_table(
+    select(tbl_coef, -direction),
+    file.path(TABLES_DIR, "tbl_gender_coef.typ"),
+    col_align = c("left", "right", "right", "right"),
+    groups    = groups_coef
+)
+```
+
+### Decomposition: total vs. direct gender effect
+
+```{r decomp-regressions, dependson=c('labels','merge-seat-share')}
+suppressPackageStartupMessages({
+    library(sandwich)
+    library(lmtest)
+})
+
+results_decomp <- lapply(topic_cols, function(col) {
+    tid <- as.integer(sub("topic_0*", "", col))
+    df <- data.frame(
+        y         = theta[[col]],
+        gender_f  = factor(theta$gender, levels = c("male", "female")),
+        faction_f = factor(theta$faction),
+        year      = theta$year,
+        cl        = interaction(theta$faction, theta$wp)
+    )
+
+    # Total: no faction FE
+    fit_t <- lm(y ~ gender_f + splines::bs(year, df = SPLINE_DF), data = df)
+    vcov_t <- tryCatch(
+        vcovCL(fit_t, cluster = df$cl),
+        error = function(e) vcovHC(fit_t, type = "HC1")
+    )
+    ct_t <- coeftest(fit_t, vcov. = vcov_t)
+
+    # Direct: with faction FE
+    fit_d <- lm(y ~ gender_f + faction_f + splines::bs(year, df = SPLINE_DF), data = df)
+    vcov_d <- tryCatch(
+        vcovCL(fit_d, cluster = df$cl),
+        error = function(e) vcovHC(fit_d, type = "HC1")
+    )
+    ct_d <- coeftest(fit_d, vcov. = vcov_d)
+
+    idx_t <- which(rownames(ct_t) == "gender_ffemale")
+    idx_d <- which(rownames(ct_d) == "gender_ffemale")
+
+    data.frame(
+        topic       = tid,
+        est_total   = ct_t[idx_t, 1], se_total   = ct_t[idx_t, 2],
+        tval_total  = ct_t[idx_t, 3], p_total    = ct_t[idx_t, 4],
+        est_direct  = ct_d[idx_d, 1], se_direct  = ct_d[idx_d, 2],
+        tval_direct = ct_d[idx_d, 3], p_direct   = ct_d[idx_d, 4]
+    )
+})
+
+df_decomp <- do.call(rbind, results_decomp) |>
+    mutate(
+        label = sub("^\\d+: ", "", TOPIC_LABEL[as.character(topic)]),
+        ci_lo_t = est_total - 1.96 * se_total,
+        ci_hi_t = est_total + 1.96 * se_total,
+        ci_lo_d = est_direct - 1.96 * se_direct,
+        ci_hi_d = est_direct + 1.96 * se_direct,
+        sig_total = p_total < SIG_ALPHA,
+        sig_direct = p_direct < SIG_ALPHA,
+        mediated = est_total - est_direct,
+        mediated_norm = sign(est_total) * mediated
+    )
+
+cat(sprintf(
+    "Total effect sig. (p<%.2f): %d/%d | Direct effect sig.: %d/%d\n",
+    SIG_ALPHA,
+    sum(df_decomp$sig_total), nrow(df_decomp),
+    sum(df_decomp$sig_direct), nrow(df_decomp)
+))
+cat(sprintf(
+    "Correlation total vs. direct estimates: r = %.3f\n",
+    cor(df_decomp$est_total, df_decomp$est_direct)
+))
+cat(sprintf(
+    "Mean |mediated| / |total|: %.1f%% (fraction of gap attributable to party sorting)\n",
+    100 * mean(abs(df_decomp$mediated) / (abs(df_decomp$est_total) + 1e-10))
+))
+```
+
+```{r decomp-forest, dependson='decomp-regressions'}
+# Bar chart of the direction-normalised faction-mediated component
+# The normalisation is necessary because est_total - est_direct has opposite meaningfor male-coded (negative) vs female-coded (positive) topics
+top_decomp <- df_decomp |>
+    slice_max(abs(tval_total), n = TOP_N_GENDER_FOREST) |>
+    arrange(mediated_norm) |>
+    mutate(
+        label = sapply(label, function(x) paste(strwrap(x, width = LABEL_WRAP_WIDTH), collapse = "\n")),
+        label = factor(label, levels = label)
+    )
+
+p <- ggplot(top_decomp, aes(mediated_norm, label)) +
+    geom_vline(xintercept = 0, colour = cfg$colors$axis_line, linewidth = 0.4, linetype = "dashed") +
+    geom_col(width = 0.6, colour = NA, fill = RED) +
+    scale_x_continuous(labels = \(x) sprintf("%+.0f\u2030", x * 1000)) +
+    labs(
+        x = "Mediated component (\u2030)",
+        y = NULL,
+    ) +
+    thesis_theme +
+    theme(legend.position = "none", axis.text.y = element_text(size = 8.5))
+
+ggsave(file.path(FIGURES, "stm_gender_decomp.svg"),
+    p,
+    width = TW, height = TW * 1.3, dpi = DPI
+)
+p
+```
+
+### Gender gap over time
+
+```{r over-time-setup}
+# Derive labels from the CSV-backed TOPIC_LABEL: strip number prefix, wrap at 35 chars
+SHORT_LABELS <- setNames(
+    sapply(
+        sub("^\\d+: ", "", TOPIC_LABEL[as.character(NARRATIVE_TOPICS)]),
+        function(x) paste(strwrap(x, width = NARRATIVE_LABEL_WRAP_WIDTH), collapse = "\n")
+    ),
+    as.character(NARRATIVE_TOPICS)
+)
+
+# Sort by STM female coefficient: most female first, most male last
+topic_order <- coef_table |>
+    filter(term == "genderfemale", topic %in% NARRATIVE_TOPICS) |>
+    arrange(desc(estimate)) |>
+    pull(topic)
+LABEL_ORDER <- SHORT_LABELS[as.character(topic_order)]
+```
+
+```{r theta-by-gender, dependson='over-time-setup'}
+narr_cols <- sprintf("topic_%02d", NARRATIVE_TOPICS)
+
+df_yr <- theta |>
+    select(gender, year, all_of(narr_cols)) |>
+    pivot_longer(all_of(narr_cols), names_to = "topic_col", values_to = "theta_val") |>
+    mutate(
+        topic        = as.integer(sub("topic_0*", "", topic_col)),
+        label        = SHORT_LABELS[as.character(topic)],
+        gender_label = ifelse(gender == "female", "Female", "Male")
+    ) |>
+    group_by(year, gender_label, label) |>
+    summarise(theta_val = mean(theta_val), .groups = "drop") |>
+    mutate(label = factor(label, levels = LABEL_ORDER))
+
+p1 <- ggplot(df_yr, aes(year, theta_val, colour = gender_label, group = gender_label)) +
+    geom_line(linewidth = 0.35, alpha = 0.3) +
+    geom_smooth(method = "loess", se = FALSE, linewidth = 0.9, span = 0.5) +
+    facet_wrap(~label, ncol = 3, scales = "free_y") +
+    scale_colour_manual(values = GENDER_COLORS, name = NULL) +
+    scale_x_continuous(breaks = X_BREAK_YEARS) +
+    scale_y_continuous(labels = \(x) sprintf("%.0f\u2030", x * 1000)) +
+    labs(
+        x = "Year", y = "Mean θ (\u2030)", colour = NULL
+    ) +
+    thesis_theme +
+    theme(
+        axis.text.x      = element_text(size = 7),
+        axis.text.y      = element_text(size = 7),
+        strip.text       = element_text(size = 7),
+        plot.margin      = margin(6, 8, 6, 6, "pt")
+    )
+
+ggsave(file.path(FIGURES, "stm_gender_over_time_selected.svg"),
+    p1,
+    width = TW, height = TW * 1.1, dpi = DPI
+)
+p1
+```
+
+```{r marginal-effects, dependson='over-time-setup'}
+interaction_terms <- paste0("genderfemale:s(year, df = ", SPLINE_DF, ")", 1:SPLINE_DF)
+year_grid <- min(theta$year):max(theta$year)
+
+# B-spline basis — identical to what stm used in train script: splines::bs(year, df=5)
+B <- splines::bs(year_grid,
+    knots          = quantile(theta$year, c(1 / 3, 2 / 3)),
+    Boundary.knots = range(theta$year),
+    degree         = 3L,
+    intercept      = FALSE
+)
+
+me_rows <- lapply(NARRATIVE_TOPICS, function(tid) {
+    topic_idx <- which(effects$topics == tid)
+    draws <- effects$parameters[[topic_idx]] # list of 25 draws
+
+    # For each year, compute ME across all 25 draws
+    yr_rows <- lapply(seq_along(year_grid), function(i) {
+        b_t <- B[i, ] # 5-vector of spline basis values at this year
+
+        me_draws <- sapply(draws, function(d) {
+            d$est["genderfemale"] + sum(b_t * d$est[interaction_terms])
+        })
+
+        data.frame(
+            topic  = tid,
+            label  = SHORT_LABELS[as.character(tid)],
+            year   = year_grid[i],
+            me     = mean(me_draws),
+            ci_lo  = quantile(me_draws, 0.025),
+            ci_hi  = quantile(me_draws, 0.975)
+        )
+    })
+    do.call(rbind, yr_rows)
+})
+
+df_me <- do.call(rbind, me_rows) |>
+    mutate(label = factor(label, levels = LABEL_ORDER))
+
+p2 <- ggplot(df_me, aes(year, me)) +
+    geom_hline(yintercept = 0, colour = GRID_GRAY, linewidth = 0.5, linetype = "dashed") +
+    geom_ribbon(aes(ymin = ci_lo, ymax = ci_hi), fill = RED, alpha = 0.08) +
+    geom_line(colour = RED, linewidth = 0.9) +
+    facet_wrap(~label, ncol = 3, scales = "free_y") +
+    scale_x_continuous(breaks = X_BREAK_YEARS) +
+    scale_y_continuous(labels = \(x) sprintf("%+.0f\u2030", x * 1000)) +
+    labs(
+        x = "Year",
+        y = "Marginal effect (\u2030)",
+    ) +
+    thesis_theme +
+    theme(
+        axis.text.x = element_text(size = 7),
+        axis.text.y = element_text(size = 7),
+        strip.text  = element_text(size = 7),
+        plot.margin = margin(6, 8, 6, 6, "pt")
+    )
+
+ggsave(file.path(FIGURES, "stm_gender_gap_trend.svg"),
+    p2,
+    width = TW, height = TW * 1.1, dpi = DPI
+)
+p2
+```
+
+```{r speech-share, dependson='labels'}
+female_share <- theta |>
+    count(year, gender) |>
+    pivot_wider(names_from = gender, values_from = n, values_fill = 0) |>
+    mutate(female_share = female / (female + male))
+
+cat(sprintf(
+    "Female speech share: %.1f%% (1990) → %.1f%% (2021)\n",
+    100 * female_share$female_share[female_share$year == min(female_share$year)],
+    100 * female_share$female_share[female_share$year == max(female_share$year)]
+))
+
+p3 <- ggplot(female_share, aes(year, female_share)) +
+    geom_area(fill = RED, alpha = 0.18) +
+    geom_line(colour = RED, linewidth = 0.8) +
+    scale_x_continuous(breaks = X_BREAK_YEARS) +
+    scale_y_continuous(labels = percent, limits = c(0, 0.5)) +
+    labs(
+        x = "Year", y = "Female speech share"
+    ) +
+    thesis_theme
+
+ggsave(file.path(FIGURES, "stm_female_speech_share.svg"),
+    p3,
+    width = TW, height = TW * 0.5, dpi = DPI
+)
+p3
+```
+
+---
+
+## Part II: Aggregate composition effects
+
+```{r aggregate-panel, dependson='merge-seat-share'}
+agg_all <- theta |>
+    group_by(faction, wp) |>
+    summarise(across(all_of(topic_cols), mean), .groups = "drop") |>
+    left_join(female_share_ft, by = c("wp", "faction")) |>
+    filter(!is.na(female_share_ft))
+
+agg_male <- theta |>
+    filter(gender == "male") |>
+    group_by(faction, wp) |>
+    summarise(across(all_of(topic_cols), mean), .groups = "drop") |>
+    left_join(female_share_ft, by = c("wp", "faction")) |>
+    filter(!is.na(female_share_ft))
+
+cat(sprintf("Spec A (all speakers): %d faction×term cells\n", nrow(agg_all)))
+cat(sprintf("Spec B (male speakers): %d faction×term cells\n", nrow(agg_male)))
+```
+
+```{r panel-regressions, dependson='aggregate-panel'}
+run_panel <- function(agg) {
+    bind_rows(lapply(topic_cols, function(col) {
+        tid <- as.integer(sub("topic_0*", "", col))
+        df <- data.frame(
+            y       = agg[[col]],
+            share   = agg$female_share_ft,
+            faction = factor(agg$faction),
+            wp      = factor(agg$wp)
+        )
+        df <- df[complete.cases(df), ]
+        if (nrow(df) < 10) {
+            return(NULL)
+        }
+
+        fit <- lm(y ~ share + faction + wp, data = df)
+        ct <- coeftest(fit, vcov. = vcovHC(fit, type = "HC1"))
+        idx <- which(rownames(ct) == "share")
+        if (length(idx) == 0) {
+            return(NULL)
+        }
+
+        data.frame(
+            topic = tid,
+            est   = ct[idx, 1], se   = ct[idx, 2],
+            tval  = ct[idx, 3], pval = ct[idx, 4]
+        )
+    }))
+}
+
+df_specA <- run_panel(agg_all) |>
+    mutate(
+        label = sub("^\\d+: ", "", TOPIC_LABEL[as.character(topic)]),
+        ci_lo = est - 1.96 * se, ci_hi = est + 1.96 * se,
+        sig = pval < SIG_ALPHA
+    )
+
+df_specB <- run_panel(agg_male) |>
+    mutate(
+        label = sub("^\\d+: ", "", TOPIC_LABEL[as.character(topic)]),
+        ci_lo = est - 1.96 * se, ci_hi = est + 1.96 * se,
+        sig = pval < SIG_ALPHA
+    )
+
+cat("Spec A — all speakers:\n")
+cat(sprintf(
+    "  sig. positive: %d | sig. negative: %d | total sig: %d/%d (p<%.2f)\n",
+    sum(df_specA$sig & df_specA$est > 0), sum(df_specA$sig & df_specA$est < 0),
+    sum(df_specA$sig), nrow(df_specA), SIG_ALPHA
+))
+cat("Spec B — male speakers only:\n")
+cat(sprintf(
+    "  sig. positive: %d | sig. negative: %d | total sig: %d/%d (p<%.2f)\n",
+    sum(df_specB$sig & df_specB$est > 0), sum(df_specB$sig & df_specB$est < 0),
+    sum(df_specB$sig), nrow(df_specB), SIG_ALPHA
+))
+```
+
+```{r panel-permutation, dependson='panel-regressions'}
+# Permutation inference for Spec A and Spec B
+
+N_PERM <- 999
+set.seed(42)
+
+run_permutation <- function(agg) {
+    # Residualise female_share from faction + term FEs
+    x_resid <- residuals(lm(female_share_ft ~ factor(faction) + factor(wp), data = agg))
+    ss_x <- sum(x_resid^2)
+
+    # Residualise each topic's mean theta from the same FEs
+    y_resid <- vapply(topic_cols, function(col) {
+        residuals(lm(agg[[col]] ~ factor(agg$faction) + factor(agg$wp)))
+    }, numeric(nrow(agg))) # nrow(agg) × K matrix
+
+    # Observed beta
+    obs_beta <- drop(crossprod(y_resid, x_resid)) / ss_x
+
+    # Permutation null: shuffle x_resid, recompute beta via inner product
+    perm_betas <- matrix(NA_real_, N_PERM, length(topic_cols))
+    for (i in seq_len(N_PERM)) {
+        x_perm <- sample(x_resid)
+        perm_betas[i, ] <- drop(crossprod(y_resid, x_perm)) / ss_x
+    }
+
+    # Two-sided p-value and permutation CI
+    lapply(seq_along(topic_cols), function(j) {
+        pval <- mean(abs(perm_betas[, j]) >= abs(obs_beta[j]))
+        c_crit <- quantile(abs(perm_betas[, j]), 1 - SIG_ALPHA)
+        list(pval = pval, ci_lo = obs_beta[j] - c_crit, ci_hi = obs_beta[j] + c_crit)
+    }) |>
+        (\(res) list(
+            pval  = vapply(res, `[[`, numeric(1), "pval"),
+            ci_lo = vapply(res, `[[`, numeric(1), "ci_lo"),
+            ci_hi = vapply(res, `[[`, numeric(1), "ci_hi")
+        ))()
+}
+
+perm_A <- run_permutation(agg_all)
+perm_B <- run_permutation(agg_male)
+
+# Attach permutation p-values and CIs, replace OLS CIs for visual consistency
+df_specA <- df_specA |>
+    mutate(
+        perm_pval = perm_A$pval,
+        perm_sig  = perm_pval < SIG_ALPHA,
+        ci_lo     = perm_A$ci_lo,
+        ci_hi     = perm_A$ci_hi
+    )
+df_specB <- df_specB |>
+    mutate(
+        perm_pval = perm_B$pval,
+        perm_sig  = perm_pval < SIG_ALPHA,
+        ci_lo     = perm_B$ci_lo,
+        ci_hi     = perm_B$ci_hi
+    )
+
+cat(sprintf(
+    "Spec A — OLS sig: %d → permutation sig: %d (p<%.2f, N=%d permutations)\n",
+    sum(df_specA$sig), sum(df_specA$perm_sig), SIG_ALPHA, N_PERM
+))
+cat(sprintf(
+    "Spec B — OLS sig: %d → permutation sig: %d (p<%.2f, N=%d permutations)\n",
+    sum(df_specB$sig), sum(df_specB$perm_sig), SIG_ALPHA, N_PERM
+))
+```
+
+### Spec A: all speakers
+
+```{r specA-forest, dependson='panel-permutation'}
+make_comp_forest <- function(df) {
+    df_plot <- df |>
+        slice_max(abs(tval), n = TOP_N_COMPOSITION_FOREST) |>
+        arrange(est) |>
+        mutate(
+            label = sapply(label, function(x) paste(strwrap(x, width = LABEL_WRAP_WIDTH), collapse = "\n")),
+            label = factor(label, levels = label)
+        )
+    ggplot(df_plot, aes(est, label, colour = perm_sig, shape = perm_sig, fill = perm_sig)) +
+        geom_vline(xintercept = 0, colour = cfg$colors$axis_line, linewidth = 0.4, linetype = "dashed") +
+        geom_errorbarh(aes(xmin = ci_lo, xmax = ci_hi), height = 0, linewidth = 0.4) +
+        geom_point(size = 2.5, stroke = 0.6) +
+        scale_colour_manual(
+            values = c("TRUE" = RED, "FALSE" = NS_GRAY),
+            labels = function(x) {
+                txt <- ifelse(
+                    x == "TRUE",
+                    sprintf("'Significant ('*italic(p)<%s*')'", format(SIG_ALPHA, nsmall = 2)),
+                    "'Not significant'"
+                )
+                parse(text = txt)
+            },
+            name = NULL
+        ) +
+        scale_fill_manual(values = c("TRUE" = RED, "FALSE" = "white"), guide = "none") +
+        scale_shape_manual(
+            values = c("TRUE" = 16, "FALSE" = 21),
+            labels = function(x) {
+                txt <- ifelse(
+                    x == "TRUE",
+                    sprintf("'Significant ('*italic(p)<%s*')'", format(SIG_ALPHA, nsmall = 2)),
+                    "'Not significant'"
+                )
+                parse(text = txt)
+            },
+            name = NULL
+        ) +
+        scale_x_continuous(labels = \(x) sprintf("%+.2f\u2030", x * 1000)) +
+        labs(
+            x = "\u0394 mean \u03b8)",
+            y = NULL,
+        ) +
+        thesis_theme +
+        theme(axis.text.y = element_text(size = 7))
+}
+
+p_A <- make_comp_forest(df_specA)
+ggsave(file.path(FIGURES, "stm_composition_specA.svg"),
+    p_A,
+    width = TW, height = TW * 1.3, dpi = DPI
+)
+p_A
+```
+
+### Spec B: male speakers only
+
+```{r specB-forest, dependson='panel-permutation'}
+p_B <- make_comp_forest(df_specB)
+ggsave(file.path(FIGURES, "stm_composition_specB.svg"),
+    p_B,
+    width = TW, height = TW * 1.3, dpi = DPI
+)
+p_B
+```
+
+### Comparing Spec A and Spec B
+
+Points above the diagonal indicate topics where the effect on male speakers *exceeds* the overall average — a pattern consistent with institutional norm shift rather than simple compositional replacement. Points below the diagonal indicate that the aggregate effect is diluted or reversed among men.
+
+```{r specAB-compare, dependson='panel-permutation'}
+df_compare <- merge(
+    df_specA |> select(topic, label, est_A = est, sig_A = perm_sig),
+    df_specB |> select(topic, est_B = est, sig_B = perm_sig),
+    by = "topic"
+) |> mutate(
+    sig_either = sig_A | sig_B,
+    importance = sqrt(est_A^2 + est_B^2),
+    label_short = sub("^\\d+: ", "", label)
+)
+
+df_compare_labeled <- df_compare |>
+    mutate(
+        quadrant      = paste0(ifelse(est_A >= 0, "R", "L"), ifelse(est_B >= 0, "U", "D")),
+        dist_diagonal = abs(est_B - est_A)
+    )
+
+df_labels <- df_compare_labeled |> filter(sig_either)
+
+p <- ggplot(df_compare, aes(est_A, est_B)) +
+    geom_abline(intercept = 0, slope = 1, colour = GRID_GRAY, linetype = "dashed", linewidth = 0.5) +
+    geom_hline(yintercept = 0, colour = GRID_GRAY, linewidth = 0.3) +
+    geom_vline(xintercept = 0, colour = GRID_GRAY, linewidth = 0.3) +
+    geom_rug(aes(colour = sig_either), linewidth = 0.25, alpha = 0.6, outside = FALSE) +
+    geom_point(aes(colour = sig_either, shape = sig_either, fill = sig_either), size = 1.5, stroke = 0.6) +
+    geom_text_repel(
+        data = df_labels,
+        aes(label = label_short),
+        size = 1.54, colour = DARK_GRAY,
+        max.overlaps = Inf, seed = 42,
+        segment.size = 0.3, segment.colour = GRID_GRAY,
+        min.segment.length = 0,
+        box.padding = 0.15, point.padding = 0.1
+    ) +
+    scale_colour_manual(values = c("TRUE" = RED, "FALSE" = NS_GRAY), guide = "none") +
+    scale_fill_manual(values = c("TRUE" = RED, "FALSE" = "white"), guide = "none") +
+    scale_shape_manual(values = c("TRUE" = 16, "FALSE" = 21), guide = "none") +
+    scale_x_continuous(labels = \(x) sprintf("%+.2f\u2030", x * 1000)) +
+    scale_y_continuous(labels = \(x) sprintf("%+.2f\u2030", x * 1000)) +
+    labs(
+        x = "Spec A \u2014 all speakers (\u0394 mean \u03b8)",
+        y = "Spec B \u2014 male speakers only (\u0394 mean \u03b8)"
+    ) +
+    thesis_theme
+
+ggsave(file.path(FIGURES, "stm_composition_specAB_compare.svg"),
+    p,
+    width = TW, height = TW * 0.85, dpi = DPI
+)
+p
+```
+
+
+## Export stats for Typst
+
+Key model statistics are written to `writing/include/stm_vars.json` for use in typst via `#stm.field`.
+
+```{r export-stm-vars, cache=FALSE, dependson=c('labels','exclusivity','entropy','decomp-regressions','panel-permutation')}
+suppressPackageStartupMessages(library(jsonlite))
+
+stm_vars <- list(
+    # Model specification & corpus
+    k = K_total,
+    k_substantive = K,
+    k_procedural = length(PROCEDURAL),
+    n_speeches_stm = nrow(theta),
+    n_speeches_stm_fmt = format(nrow(theta), big.mark = ","),
+    sig_alpha = SIG_ALPHA,
+    sig_alpha_fmt = sprintf("%.2f", SIG_ALPHA),
+    conc_pctile = as.integer(SIG_ALPHA * 100),
+    top_n_words = 10L,
+    n_perm = N_PERM,
+    seed = 42L,
+    spline_df = SPLINE_DF,
+    # Model diagnostics
+    mean_entropy = round(mean_norm, 3),
+    mean_entropy_fmt = sprintf("%.2f", mean_norm),
+    mean_exclusivity = round(mean_excl, 3),
+    mean_exclusivity_fmt = sprintf("%.1f%%", 100 * mean_excl),
+    mean_concentration = round(mean_conc, 4),
+    mean_concentration_fmt = sprintf("%.3f", mean_conc),
+    cor_excl_conc = round(cor_excl_conc, 3),
+    cor_excl_conc_fmt = sprintf("%.2f", cor_excl_conc),
+    n_hi_quality_topics = n_hi_quality,
+    share_hi_quality_topics = round(share_hi_quality, 3),
+    share_hi_quality_topics_fmt = sprintf("%.1f%%", 100 * share_hi_quality),
+    # Individual-level results (Part I)
+    n_sig_gender = sum(coef_table$term == "genderfemale" & coef_table$pval < SIG_ALPHA),
+    n_female_gt = sum(coef_table$term == "genderfemale" & coef_table$pval < SIG_ALPHA & coef_table$estimate > 0),
+    n_male_gt = sum(coef_table$term == "genderfemale" & coef_table$pval < SIG_ALPHA & coef_table$estimate < 0),
+    top_gender_female_topics = coef_table |>
+        filter(term == "genderfemale", pval < SIG_ALPHA, estimate > 0) |>
+        arrange(desc(estimate)) |>
+        slice_head(n = 4) |>
+        mutate(label_en = manual$label_en[match(topic, manual$topic)]) |>
+        pull(label_en) |>
+        paste(collapse = ", "),
+    top_gender_male_topics = coef_table |>
+        filter(term == "genderfemale", pval < SIG_ALPHA, estimate < 0) |>
+        arrange(estimate) |>
+        slice_head(n = 4) |>
+        mutate(label_en = manual$label_en[match(topic, manual$topic)]) |>
+        pull(label_en) |>
+        paste(collapse = ", "),
+    r_total_direct = round(cor(df_decomp$est_total, df_decomp$est_direct), 4),
+    r_total_direct_fmt = sprintf("%.3f", cor(df_decomp$est_total, df_decomp$est_direct)),
+    n_direct_gt_total = sum(df_decomp$mediated_norm < 0),
+    decomp_clearest_label_en = manual$label_en[match(
+        df_decomp |>
+            mutate(diff = abs(est_total - est_direct)) |>
+            slice_max(diff, n = 1) |>
+            pull(topic),
+        manual$topic
+    )],
+    # Aggregate composition results (Part II)
+    n_cells_specA = nrow(agg_all),
+    n_cells_specB = nrow(agg_male),
+    n_sig_specA = sum(df_specA$perm_sig),
+    n_sig_specB = sum(df_specB$perm_sig),
+    # Effect of a 10pp increase in female seat share, in per-mille (est * 0.1 * 1000)
+    specA_effect_10pp_lo = round(min(abs(df_specA$est[df_specA$perm_sig])) * 0.1 * 1000, 1),
+    specA_effect_10pp_hi = round(max(abs(df_specA$est[df_specA$perm_sig])) * 0.1 * 1000, 1),
+    specA_positive_topics = df_specA |>
+        filter(perm_sig, est > 0) |>
+        arrange(desc(tval)) |>
+        slice_head(n = 4) |>
+        mutate(label_en = manual$label_en[match(topic, manual$topic)]) |>
+        pull(label_en) |>
+        paste(collapse = ", "),
+    specA_negative_topics = df_specA |>
+        filter(perm_sig, est < 0) |>
+        arrange(tval) |>
+        slice_head(n = 4) |>
+        mutate(label_en = manual$label_en[match(topic, manual$topic)]) |>
+        pull(label_en) |>
+        paste(collapse = ", "),
+    specB_positive_topics = df_specB |>
+        filter(perm_sig, est > 0) |>
+        arrange(desc(tval)) |>
+        slice_head(n = 4) |>
+        mutate(label_en = manual$label_en[match(topic, manual$topic)]) |>
+        pull(label_en) |>
+        paste(collapse = ", "),
+    specB_negative_topics = df_specB |>
+        filter(perm_sig, est < 0) |>
+        arrange(tval) |>
+        slice_head(n = 4) |>
+        mutate(label_en = manual$label_en[match(topic, manual$topic)]) |>
+        pull(label_en) |>
+        paste(collapse = ", "),
+    # Spec B estimates for key female-coded topics (topics 30, 34, 41, 62)
+    specB_womens_policy_est   = round(df_specB$est[df_specB$topic == 41] * 1000, 2),
+    specB_womens_policy_pval  = round(df_specB$perm_pval[df_specB$topic == 41], 3),
+    specB_repro_rights_est    = round(df_specB$est[df_specB$topic == 30] * 1000, 2),
+    specB_repro_rights_pval   = round(df_specB$perm_pval[df_specB$topic == 30], 3),
+    specB_family_policy_est   = round(df_specB$est[df_specB$topic == 34] * 1000, 2),
+    specB_family_policy_pval  = round(df_specB$perm_pval[df_specB$topic == 34], 3),
+    specB_childrens_youth_est = round(df_specB$est[df_specB$topic == 62] * 1000, 2),
+    specB_childrens_youth_pval = round(df_specB$perm_pval[df_specB$topic == 62], 3)
+)
+
+out <- file.path(REPO_ROOT, "writing", "include", "stm_vars.json")
+write_json(stm_vars, out, auto_unbox = TRUE, pretty = TRUE)
+cat(sprintf("Written to %s\n", out))
+```
+
+---
+
+## Poster figures
+
+Constants for all poster figures:
+
+```{r poster-setup}
+POSTER_W <- 10 # figure width in inches (≈ one A1 column)
+POSTER_BASE <- 13 # base font size
+TOP_N_COEF <- 4 # top N topics per gender direction in coef plot
+TOP_N_TREND <- 5 # top N topics per direction in trend plot
+TOP_N_COMP <- 10 # top N topics in composition plot
+
+poster_theme <- theme_minimal(base_size = POSTER_BASE) +
+    theme(
+        text               = element_text(family = "sans"),
+        plot.title         = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor   = element_blank(),
+        panel.grid.major.y = element_line(colour = "#E5E7EB", linewidth = 0.3),
+        axis.line.x        = element_line(colour = "#374151", linewidth = 0.4),
+        axis.ticks.x       = element_line(colour = "#374151", linewidth = 0.3),
+        axis.ticks.y       = element_blank(),
+        plot.margin        = margin(10, 12, 10, 10, "pt")
+    )
+```
+
+### Seat share vs. speech share
+
+```{r poster-seat-speech, dependson=c('aggregate-panel','poster-setup')}
+speech_share_ft <- theta |>
+    group_by(faction, wp) |>
+    summarise(
+        female_speech_share = mean(gender == "female"),
+        .groups             = "drop"
+    ) |>
+    left_join(female_share_ft, by = c("wp", "faction")) |>
+    filter(!is.na(female_share_ft))
+
+p_seat_speech <- ggplot(
+    speech_share_ft,
+    aes(female_share_ft, female_speech_share, colour = faction)
+) +
+    geom_abline(
+        slope = 1, intercept = 0,
+        colour = "#D1D5DB", linewidth = 0.6, linetype = "dashed"
+    ) +
+    geom_point(size = 3, alpha = 0.75) +
+    geom_smooth(aes(group = 1),
+        method = "lm", formula = y ~ x,
+        se = FALSE, colour = "#374151", linewidth = 1.0
+    ) +
+    scale_colour_manual(values = unlist(cfg$colors$parties), name = NULL) +
+    scale_x_continuous(
+        labels = percent_format(accuracy = 1),
+        limits = c(0, NA), expand = expansion(mult = c(0.02, 0.05))
+    ) +
+    scale_y_continuous(
+        labels = percent_format(accuracy = 1),
+        limits = c(0, NA), expand = expansion(mult = c(0.02, 0.05))
+    ) +
+    labs(
+        x = "Female seat share (faction \u00d7 term)",
+        y = "Female speech share (fraction of speeches)"
+    ) +
+    poster_theme +
+    theme(
+        legend.position    = "top",
+        legend.text        = element_text(size = POSTER_BASE - 1),
+        panel.grid.major.x = element_line(colour = "#E5E7EB", linewidth = 0.3),
+        axis.line.y        = element_line(colour = "#374151", linewidth = 0.4),
+        axis.ticks.y       = element_line(colour = "#374151", linewidth = 0.3)
+    )
+
+ggsave(file.path(FIGURES, "poster_female_seat_vs_speech_share.svg"),
+    p_seat_speech,
+    width = POSTER_W, height = POSTER_W * 0.6, dpi = DPI
+)
+p_seat_speech
+```
+
+### Gender coefficient plot — top 10
+
+```{r poster-coef, dependson=c('forest-plot','poster-setup')}
+# Rank topics by how much the gender gap varies over time: norm of the spline interaction coefficients from estimateEffect
+interaction_pattern <- paste0("genderfemale:s\\(year, df = ", SPLINE_DF, "\\)")
+df_time_score <- coef_table |>
+    filter(grepl(interaction_pattern, term)) |>
+    group_by(topic) |>
+    summarise(time_score = sqrt(sum(estimate^2)), .groups = "drop")
+
+df_coef_full <- coef_table |>
+    filter(term == "genderfemale") |>
+    mutate(
+        label = sub("^\\d+: ", "", TOPIC_LABEL[as.character(topic)]),
+        ci_lo = estimate - 1.96 * se,
+        ci_hi = estimate + 1.96 * se,
+        sig   = pval < SIG_ALPHA
+    ) |>
+    left_join(df_time_score, by = "topic")
+
+# Select by time-variation score within each direction 
+top_female_p <- df_coef_full |>
+    filter(estimate > 0, sig) |>
+    slice_max(time_score, n = TOP_N_COEF)
+top_male_p <- df_coef_full |>
+    filter(estimate < 0, sig) |>
+    slice_max(time_score, n = TOP_N_COEF)
+
+df_coef_poster <- bind_rows(
+    top_female_p |> mutate(direction = "female"),
+    top_male_p |> mutate(direction = "male")
+) |>
+    arrange(estimate) |>
+    mutate(
+        label = sapply(label, function(x) paste(strwrap(x, 42), collapse = "\n")),
+        label = factor(label, levels = label)
+    )
+
+p_coef_poster <- ggplot(df_coef_poster, aes(estimate, label, colour = direction)) +
+    geom_vline(xintercept = 0, colour = "#9CA3AF", linewidth = 0.5, linetype = "dashed") +
+    geom_errorbarh(aes(xmin = ci_lo, xmax = ci_hi),
+        height = 0, linewidth = 0.8, alpha = 0.55
+    ) +
+    geom_point(size = 4.5) +
+    scale_colour_manual(
+        values = c("female" = RED, "male" = cfg$colors$blue),
+        labels = c("female" = "Female MPs speak more", "male" = "Male MPs speak more"),
+        name   = NULL
+    ) +
+    scale_x_continuous(
+        labels = \(x) sprintf("%+.0f\u2030", x * 1000),
+        expand = expansion(mult = 0.12)
+    ) +
+    labs(x = "Gender effect on topic share (\u0394\u03b8, \u00b195\u202f% CI)", y = NULL) +
+    poster_theme +
+    theme(
+        legend.position = "top",
+        legend.text     = element_text(size = POSTER_BASE),
+        axis.text.y     = element_text(size = POSTER_BASE - 1, lineheight = 0.9)
+    )
+
+ggsave(file.path(FIGURES, "poster_gender_coef.svg"),
+    p_coef_poster,
+    width = POSTER_W, height = POSTER_W * 0.58, dpi = DPI
+)
+p_coef_poster
+```
+
+### Time-varying gender gap — top 6
+
+```{r poster-trend, dependson=c('marginal-effects','poster-setup')}
+POSTER_NARRATIVE <- NARRATIVE_TOPICS
+
+SHORT_LABELS_P <- setNames(
+    sapply(
+        sub("^\\d+: ", "", TOPIC_LABEL[as.character(POSTER_NARRATIVE)]),
+        function(x) paste(strwrap(x, 18), collapse = "\n")
+    ),
+    as.character(POSTER_NARRATIVE)
+)
+
+poster_label_order <- coef_table |>
+    filter(term == "genderfemale", topic %in% POSTER_NARRATIVE) |>
+    arrange(desc(estimate)) |>
+    pull(topic)
+
+df_me_p <- df_me |>
+    filter(topic %in% POSTER_NARRATIVE) |>
+    mutate(
+        label = SHORT_LABELS_P[as.character(topic)],
+        label = factor(label, levels = SHORT_LABELS_P[as.character(poster_label_order)])
+    )
+
+p_trend_poster <- ggplot(df_me_p, aes(year, me)) +
+    geom_hline(yintercept = 0, colour = "#9CA3AF", linewidth = 0.5, linetype = "dashed") +
+    geom_ribbon(aes(ymin = ci_lo, ymax = ci_hi), fill = RED, alpha = 0.12, colour = NA) +
+    geom_line(colour = RED, linewidth = 1.2) +
+    facet_wrap(~label, ncol = 4, scales = "free_y") +
+    scale_x_continuous(breaks = X_BREAK_YEARS) +
+    scale_y_continuous(labels = \(x) sprintf("%+.0f‰", x * 1000)) +
+    labs(x = "Year", y = "Marginal effect (‰)") +
+    poster_theme +
+    theme(
+        legend.position = "none",
+        strip.text      = element_text(size = POSTER_BASE - 2, face = "bold", lineheight = 0.9),
+        axis.text.x     = element_text(size = POSTER_BASE - 2),
+        axis.text.y     = element_text(size = POSTER_BASE - 2)
+    )
+
+ggsave(file.path(FIGURES, "poster_gender_gap_trend.svg"),
+    p_trend_poster,
+    width = POSTER_W, height = POSTER_W * 0.75, dpi = DPI
+)
+p_trend_poster
+```
+
+### Composition effects — top 10
+
+Top `r TOP_N_COMP` topics by |t| from Spec A, coloured by direction and permutation significance.
+
+```{r poster-comp, dependson=c('panel-permutation','poster-setup')}
+df_comp_poster <- df_specA |>
+    slice_max(abs(tval), n = TOP_N_COMP) |>
+    arrange(est) |>
+    mutate(
+        label = sapply(label, function(x) paste(strwrap(x, 42), collapse = "\n")),
+        label = factor(label, levels = label),
+        colour_group = case_when(
+            perm_sig & est > 0 ~ "increase",
+            perm_sig & est < 0 ~ "decrease",
+            TRUE ~ "ns"
+        )
+    )
+
+p_comp_poster <- ggplot(
+    df_comp_poster,
+    aes(est, label, colour = colour_group, shape = perm_sig)
+) +
+    geom_vline(xintercept = 0, colour = "#9CA3AF", linewidth = 0.5, linetype = "dashed") +
+    geom_errorbarh(aes(xmin = ci_lo, xmax = ci_hi),
+        height = 0, linewidth = 0.8, alpha = 0.55
+    ) +
+    geom_point(size = 4.5) +
+    scale_colour_manual(
+        values = c("increase" = RED, "decrease" = cfg$colors$blue, "ns" = NS_GRAY),
+        labels = c(
+            "increase" = "\u2191 with female share",
+            "decrease" = "\u2193 with female share",
+            "ns"       = "Not significant"
+        ),
+        name = NULL
+    ) +
+    scale_shape_manual(values = c("TRUE" = 16, "FALSE" = 16), guide = "none") +
+    scale_x_continuous(
+        labels = \(x) sprintf("%+.2f\u2030", x * 1000),
+        expand = expansion(mult = 0.12)
+    ) +
+    labs(
+        x = "\u0394 mean topic share per unit female seat share (0\u2192100\u202f%)",
+        y = NULL
+    ) +
+    poster_theme +
+    theme(
+        legend.position = "top",
+        legend.text     = element_text(size = POSTER_BASE),
+        axis.text.y     = element_text(size = POSTER_BASE - 1, lineheight = 0.9)
+    )
+
+ggsave(file.path(FIGURES, "poster_composition_specA.svg"),
+    p_comp_poster,
+    width = POSTER_W, height = POSTER_W * 0.58, dpi = DPI
+)
+p_comp_poster
+```
+
+### Female seat share by faction over time
+
+```{r poster-faction-share, dependson=c('merge-seat-share'), cache=FALSE}
+party_colors <- unlist(cfg$colors$parties)
+
+# Use theta rather than parquet-loaded female_share_ft
+df_faction_share <- theta |>
+    distinct(wp, faction, female_share_ft) |>
+    filter(!is.na(female_share_ft), faction %in% names(party_colors)) |>
+    mutate(
+        wp      = as.integer(wp),
+        faction = factor(as.character(faction), levels = intersect(FACTION_PLOT_ORDER, unique(faction)))
+    )
+
+p_faction_share <- ggplot(df_faction_share, aes(wp, female_share_ft, colour = faction, group = faction)) +
+    geom_line(linewidth = 1.0) +
+    geom_point(size = 2.5) +
+    scale_colour_manual(values = party_colors, name = NULL) +
+    scale_x_continuous(
+        breaks = cfg$analysis$bounds$term_lower:cfg$analysis$bounds$term_upper,
+        labels = \(x) paste0("WP", x)
+    ) +
+    scale_y_continuous(
+        labels = percent_format(accuracy = 1),
+        limits = c(0, NA),
+        expand = expansion(mult = c(0.02, 0.08))
+    ) +
+    labs(x = NULL, y = "Female seat share") +
+    poster_theme +
+    theme(
+        legend.position    = "top",
+        legend.text        = element_text(size = POSTER_BASE - 1),
+        panel.grid.major.x = element_line(colour = "#E5E7EB", linewidth = 0.3),
+        axis.line.y        = element_line(colour = "#374151", linewidth = 0.4),
+        axis.ticks.y       = element_line(colour = "#374151", linewidth = 0.3)
+    )
+
+ggsave(file.path(FIGURES, "poster_faction_seat_share.svg"),
+    p_faction_share,
+    width = POSTER_W, height = POSTER_W * 0.52, dpi = DPI
+)
+p_faction_share
+```
+
+### Composition effects — Spec B (male speakers only)
+
+```{r poster-comp-specB, dependson=c('panel-permutation','poster-setup')}
+df_comp_specB <- df_specB |>
+    slice_max(abs(tval), n = TOP_N_COMP) |>
+    arrange(est) |>
+    mutate(
+        direction = case_when(
+            perm_sig & est > 0 ~ "increase",
+            perm_sig & est < 0 ~ "decrease",
+            TRUE ~ "ns"
+        ),
+        label = sapply(label, function(x) paste(strwrap(x, width = 35), collapse = "\n")),
+        label = factor(label, levels = label)
+    )
+
+p_comp_specB <- ggplot(
+    df_comp_specB,
+    aes(est, label, colour = direction)
+) +
+    geom_vline(xintercept = 0, colour = "#374151", linewidth = 0.4, linetype = "dashed") +
+    geom_errorbarh(aes(xmin = ci_lo, xmax = ci_hi), height = 0, linewidth = 0.5) +
+    geom_point(size = 3.5) +
+    scale_colour_manual(
+        values  = c(increase = RED, decrease = cfg$colors$blue, ns = NS_GRAY),
+        breaks  = c("increase", "decrease"),
+        labels  = c("\u2191 with female share", "\u2193 with female share"),
+        name    = NULL
+    ) +
+    scale_x_continuous(labels = \(x) sprintf("%+.2f\u2030", x * 1000)) +
+    labs(
+        x = "\u0394 mean topic share per unit female seat share (0\u2192100%)",
+        y = NULL
+    ) +
+    poster_theme +
+    theme(
+        legend.position = "top",
+        legend.text     = element_text(size = POSTER_BASE),
+        axis.text.y     = element_text(size = POSTER_BASE - 1, lineheight = 0.9)
+    )
+
+ggsave(file.path(FIGURES, "poster_composition_specB.svg"),
+    p_comp_specB,
+    width = POSTER_W, height = POSTER_W * 0.58, dpi = DPI
+)
+p_comp_specB
+```
